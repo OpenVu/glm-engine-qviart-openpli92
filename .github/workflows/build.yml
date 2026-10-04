@@ -1,0 +1,156 @@
+name: Build glm-engine IPK for Qviart Dual 4K
+
+on:
+  workflow_dispatch:
+    inputs:
+      openpli_ref:
+        description: "OpenPLi branch or tag"
+        required: true
+        default: "release-9.2"
+        type: string
+      debug:
+        description: "Build with GLM_DEBUG logging"
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      OPENPLI_REF: ${{ inputs.openpli_ref || 'release-9.2' }}
+
+    steps:
+      - name: Checkout glm-engine source
+        uses: actions/checkout@v7
+
+      - name: Install OpenPLi/OE host dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential gcc g++ make git git-lfs \
+            diffstat chrpath cpio socat \
+            gawk wget unzip rsync \
+            texinfo help2man \
+            python3 python3-pip python3-pexpect \
+            python3-git python3-jinja2 \
+            locales \
+            libncurses5-dev libncursesw5-dev \
+            zstd lz4 xz-utils file
+          sudo locale-gen en_US.UTF-8
+
+      - name: Clone OpenPLi 9.2 build environment
+        run: |
+          git clone --depth 1 --branch "${OPENPLI_REF}" --recurse-submodules --shallow-submodules \
+            https://github.com/OpenPLi/openpli-oe-core.git openpli-oe-core
+
+      - name: Show OpenPLi revision and Qviart machine
+        working-directory: openpli-oe-core
+        run: |
+          git rev-parse HEAD
+          git status --short
+          test -d meta-qviart
+          test -f meta-qviart/conf/machine/dual.conf
+
+      - name: Initialize OpenPLi build directory
+        working-directory: openpli-oe-core
+        env:
+          MACHINE: dual
+        run: |
+          make init
+          test -f build/env.source
+          test -f build/conf/bblayers.conf
+
+      - name: Add glm custom layer
+        run: |
+          cp -a meta-glm openpli-oe-core/meta-glm
+          printf '\nBBLAYERS += "${TOPDIR}/../meta-glm"\n' >> openpli-oe-core/build/conf/bblayers.conf
+          grep -n "meta-glm" openpli-oe-core/build/conf/bblayers.conf
+
+      - name: Configure package build
+        working-directory: openpli-oe-core
+        run: |
+          cat >> build/conf/local.conf <<'EOF_CONF'
+          MACHINE = "dual"
+          PACKAGE_CLASSES = "package_ipk"
+          BB_NUMBER_THREADS = "$(nproc)"
+          PARALLEL_MAKE = "-j $(nproc)"
+          EOF_CONF
+          if [ "${{ inputs.debug || 'false' }}" = "true" ]; then
+            echo 'CXXFLAGS:append:pn-glm-engine = " -DGLM_DEBUG"' >> build/conf/local.conf
+          fi
+
+      - name: Parse recipe
+        working-directory: openpli-oe-core
+        run: |
+          . build/env.source
+          MACHINE=dual bitbake -e glm-engine > /tmp/glm-engine-env.txt
+          grep -E '^(PN|PV|PR|PACKAGE_ARCH|CXX|STAGING_INCDIR|STAGING_LIBDIR)=' /tmp/glm-engine-env.txt || true
+
+      - name: Build glm-engine IPK
+        working-directory: openpli-oe-core
+        run: |
+          . build/env.source
+          MACHINE=dual bitbake glm-engine
+
+      - name: Validate shared library inside IPK
+        working-directory: openpli-oe-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$(find build/tmp/deploy -type f -name 'glm-engine_*.ipk' | sort | tail -n 1)"
+          test -n "$PKG"
+          echo "IPK=$PKG"
+          file "$PKG"
+          rm -rf /tmp/glm-ipk-check
+          mkdir -p /tmp/glm-ipk-check
+          cd /tmp/glm-ipk-check
+          ar x "$GITHUB_WORKSPACE/openpli-oe-core/$PKG"
+          DATA="$(find . -maxdepth 1 -name 'data.tar.*' -print -quit)"
+          test -n "$DATA"
+          mkdir rootfs
+          tar -xf "$DATA" -C rootfs
+          test -f rootfs/usr/lib/libglm.so
+          file rootfs/usr/lib/libglm.so
+          readelf -h rootfs/usr/lib/libglm.so
+          echo '--- NEEDED ---'
+          readelf -d rootfs/usr/lib/libglm.so | grep NEEDED || true
+          echo '--- SONAME ---'
+          readelf -d rootfs/usr/lib/libglm.so | grep SONAME || true
+
+      - name: Collect build metadata
+        working-directory: openpli-oe-core
+        run: |
+          set -e
+          PKG="$(find build/tmp/deploy -type f -name 'glm-engine_*.ipk' | sort | tail -n 1)"
+          {
+            echo "OpenPLi ref: ${OPENPLI_REF}"
+            echo "OpenPLi commit: $(git rev-parse HEAD)"
+            echo "Machine: dual"
+            echo "Target reported by receiver: armv7l"
+            echo "Target libc reported by receiver: glibc 2.33"
+            echo "Target opkg architecture: dual"
+            echo "Package: ${PKG}"
+            echo "Build host: $(lsb_release -ds || true)"
+            echo "Compiler: $(g++ --version | head -n 1)"
+          } | tee "$GITHUB_WORKSPACE/build-info.txt"
+
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: glm-engine-qviart-dual-openpli92
+          path: |
+            openpli-oe-core/build/tmp/deploy/**/*.ipk
+            build-info.txt
+          if-no-files-found: error
+          retention-days: 30

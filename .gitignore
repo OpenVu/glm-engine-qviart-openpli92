@@ -1,0 +1,10 @@
+# Local OpenPLi build tree
+openpli-oe-core/
+build/
+sstate-cache/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
